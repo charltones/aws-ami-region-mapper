@@ -1,0 +1,85 @@
+#!/usr/bin/env python
+
+from __future__ import print_function
+import boto3
+import argparse
+import json
+import yaml
+
+BASEREGION = "us-east-1"
+client = boto3.client('ec2', region_name=BASEREGION)
+
+def find_ami(criteria):
+    ''' Given the criteria, try to find matching AMIs in the
+        base region.
+    '''
+    if criteria.amazon_linux:
+        filter = "Amazon Linux AMI * x86_64 HVM GP2"
+        owners = "amazon"
+    elif criteria.windows_2012:
+        filter = "Microsoft Windows Server 2012 R2 RTM 64-bit Locale English AMI provided*"
+        owners = "amazon"
+    else:
+        filter = criteria.description
+        owners = None
+
+    if owners:
+        results = client.describe_images(Filters=[{'Name': 'description', 'Values': [filter]}], Owners=[owners])
+    else:
+        results = client.describe_images(Filters=[{'Name': 'description', 'Values': [filter]}])
+
+    return results['Images']
+
+def build_region_map(ami_name, base_image_id):
+    ''' Given an AMI name, try to build a region map '''
+
+    region_map = {BASEREGION: {'AMI': base_image_id}}
+    regions = [region['RegionName'] for region in client.describe_regions()['Regions']]
+    for region in regions:
+        if region != BASEREGION:
+            regional_client = boto3.client('ec2', region_name=region)
+            results = regional_client.describe_images(Filters=[{'Name': 'name', 'Values': [ami_name]}])['Images']
+            if results:
+                results = sorted(results, key=lambda x: x['CreationDate'], reverse=True)[0]
+                region_map[region] = {'AMI': results['ImageId']}
+            else:
+                region_map[region] = 'not_found'
+    return {'AWSRegionToAMI': region_map}
+
+
+parser = argparse.ArgumentParser(description="Find AWS AMIs and build region maps")
+group = parser.add_mutually_exclusive_group()
+group.add_argument("-a", "--amazon-linux", help="Get latest Amazon Linux AMI", action="store_true")
+group.add_argument("-w", "--windows-2012", help="Get latest Windows Server 2012 AMI", action="store_true")
+group.add_argument("-d", "--description", help="Filter based on description", type=str)
+group2 = parser.add_mutually_exclusive_group()
+group2.add_argument("-l", "--list", help="output a list of matching AMIs", action="store_true")
+group2.add_argument("-j", "--json", help="output a json region map", action="store_true")
+group2.add_argument("-y", "--yaml", help="output a yaml region map", action="store_true")
+args = parser.parse_args()
+
+if (args.amazon_linux or args.windows_2012 or args.description) and (args.list or args.json or args.yaml):
+    amis = find_ami(args)
+    if amis:
+        amis = sorted(amis, key=lambda x: x['CreationDate'], reverse=True)
+        if args.list:
+            for ami in amis[:10]:
+                print("%s\t%s\t%s\t%s" % (ami['CreationDate'], ami['ImageId'], ami['Name'], ami['Description']))
+            num_amis = len(amis)
+            if num_amis > 10:
+                print("...and %d other matches" % (num_amis-10))
+        else:
+            print("Creating region map for...")
+            ami = amis[0]
+            print("%s\t%s\t%s\t%s" % (ami['CreationDate'], ami['ImageId'], ami['Name'], ami['Description']))
+            region_map = build_region_map(ami['Name'], ami['ImageId'])
+            if args.yaml:
+                print(yaml.dump(region_map, default_flow_style=False))
+            else:
+                print(json.dumps(region_map, sort_keys=True,
+                    indent=4, separators=(',', ': ')))
+    else:
+        print("No AMIs found using your search criteria")
+else:
+    parser.print_help()
+
